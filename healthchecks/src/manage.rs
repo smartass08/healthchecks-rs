@@ -1,205 +1,235 @@
 use crate::{
-    model::{Channel, Check, NewCheck, UpdatedCheck},
+    errors::{HealthchecksApiError, HealthchecksConfigError},
+    model::{Channel, Check, Flip, NewCheck, Ping, UpdatedCheck},
     util::default_user_agent,
 };
-use anyhow::{anyhow, Context};
-use ureq::{delete, get, post, Request};
+use std::result::Result;
+use ureq::{delete, get, post, Error, Request};
 
 const HEALTHCHECK_API_URL: &str = "https://healthchecks.io/api/v1/";
 
+/// Typealias to prevent some repetitiveness in function definitions
+pub type ApiResult<T> = Result<T, HealthchecksApiError>;
+
 /// Struct that encapsulates the API key used to communicate with the healthchecks.io
 /// management API. Instances of this struct expose methods to query the API.
-pub struct ApiConfig {
+pub struct ManageClient {
     pub(crate) api_key: String,
     pub(crate) user_agent: String,
 }
 
-/// Create an instance of [`ApiConfig`] from a given API key. No validation
+/// Create an instance of [`ManageClient`] from a given API key. No validation
 /// is performed.
-pub fn get_config(api_key: String, user_agent: Option<String>) -> anyhow::Result<ApiConfig> {
+pub fn get_client(
+    api_key: String,
+    user_agent: Option<String>,
+) -> Result<ManageClient, HealthchecksConfigError> {
     if api_key.is_empty() {
-        Err(anyhow!("API key must not be empty"))
+        Err(HealthchecksConfigError::EmptyApiKey)
     } else if let Some(ua) = user_agent {
         if ua.is_empty() {
-            Err(anyhow!("User Agent must not be empty"))
+            Err(HealthchecksConfigError::EmptyUserAgent)
         } else {
-            Ok(ApiConfig {
+            Ok(ManageClient {
                 api_key,
                 user_agent: ua,
             })
         }
     } else {
-        Ok(ApiConfig {
+        Ok(ManageClient {
             api_key,
             user_agent: default_user_agent().to_owned(),
         })
     }
 }
 
-impl ApiConfig {
-    #[inline]
-    fn set_headers<'a>(&self, req: &'a mut Request) -> &'a mut Request {
-        req.set("X-Api-Key", &self.api_key)
+impl ManageClient {
+    fn ureq_get(&self, path: String) -> Request {
+        get(&path)
+            .set("X-Api-Key", &self.api_key)
+            .set("User-Agent", &self.user_agent)
+    }
+
+    fn ureq_post(&self, path: String) -> Request {
+        post(&path)
+            .set("X-Api-Key", &self.api_key)
+            .set("User-Agent", &self.user_agent)
+    }
+
+    fn ureq_delete(&self, path: String) -> Request {
+        delete(&path)
+            .set("X-Api-Key", &self.api_key)
             .set("User-Agent", &self.user_agent)
     }
 
     /// Get a list of [`Check`]s.
-    pub fn get_checks(&self) -> anyhow::Result<Vec<Check>> {
+    pub fn get_checks(&self) -> ApiResult<Vec<Check>> {
         #[derive(serde::Deserialize)]
         struct ChecksResult {
             pub checks: Vec<Check>,
         }
-        let mut r = &mut get(&format!("{}/{}", HEALTHCHECK_API_URL, "checks"));
-        r = self.set_headers(r);
-        let resp = r.call();
-        match resp.status() {
-            200 => Ok(resp
-                .into_json_deserialize::<ChecksResult>()
-                .context("Failed to parse API response")?
-                .checks),
-            401 => Err(anyhow!("Invalid API key")),
-            _ => Err(anyhow!("Unexpected error: {}", resp.error())),
+        let r = self.ureq_get(format!("{}/{}", HEALTHCHECK_API_URL, "checks"));
+        match r.call() {
+            Ok(response) => Ok(response.into_json::<ChecksResult>()?.checks),
+            Err(Error::Status(401, _)) => Err(HealthchecksApiError::InvalidAPIKey),
+            Err(Error::Status(_, response)) => Err(HealthchecksApiError::UnexpectedError(
+                response.into_string()?,
+            )),
+            Err(Error::Transport(err)) => Err(HealthchecksApiError::TransportError(Box::new(err))),
         }
     }
 
     /// Get a [`Check`] with the given UUID or unique key.
-    pub fn get_check(&self, check_id: &str) -> anyhow::Result<Check> {
-        let mut r = &mut get(&format!(
-            "{}/{}/{}",
-            HEALTHCHECK_API_URL, "checks", check_id
-        ));
-        r = self.set_headers(r);
-        let resp = r.call();
-        match resp.status() {
-            200 => Ok(resp
-                .into_json_deserialize::<Check>()
-                .context("Failed to parse API response")?),
-            401 => Err(anyhow!("Invalid API key")),
-            403 => Err(anyhow!("Access denied")),
-            404 => Err(anyhow!(
-                "Failed to find a check with the uuid: {}",
-                check_id
+    pub fn get_check(&self, check_id: &str) -> ApiResult<Check> {
+        let r = self.ureq_get(format!("{}/{}/{}", HEALTHCHECK_API_URL, "checks", check_id));
+        match r.call() {
+            Ok(response) => Ok(response.into_json::<Check>()?),
+            Err(Error::Status(401, _)) => Err(HealthchecksApiError::InvalidAPIKey),
+            Err(Error::Status(403, _)) => Err(HealthchecksApiError::AccessDenied),
+            Err(Error::Status(404, _)) => {
+                Err(HealthchecksApiError::NoCheckFound(check_id.to_string()))
+            }
+            Err(Error::Status(_, response)) => Err(HealthchecksApiError::UnexpectedError(
+                response.into_string()?,
             )),
-            _ => Err(anyhow!("Unexpected error: {}", resp.error())),
+            Err(Error::Transport(err)) => Err(HealthchecksApiError::TransportError(Box::new(err))),
         }
     }
 
     /// Returns a list of [`Channel`]s belonging to the project.
-    pub fn get_channels(&self) -> anyhow::Result<Vec<Channel>> {
+    pub fn get_channels(&self) -> ApiResult<Vec<Channel>> {
         #[derive(serde::Deserialize)]
         struct ChannelsResult {
             pub channels: Vec<Channel>,
         }
-        let mut r = &mut get(&format!("{}/{}", HEALTHCHECK_API_URL, "channels"));
-        r = self.set_headers(r);
-        let resp = r.call();
-        match resp.status() {
-            200 => Ok(resp
-                .into_json_deserialize::<ChannelsResult>()
-                .context("Failed to parse API response")?
-                .channels),
-            401 => Err(anyhow!(
-                "Invalid API key: make sure you're not using a read-only key"
+        let r = self.ureq_get(format!("{}/{}", HEALTHCHECK_API_URL, "channels"));
+        match r.call() {
+            Ok(response) => Ok(response.into_json::<ChannelsResult>()?.channels),
+            Err(Error::Status(401, _)) => Err(HealthchecksApiError::PossibleReadOnlyKey),
+            Err(Error::Status(_, response)) => Err(HealthchecksApiError::UnexpectedError(
+                response.into_string()?,
             )),
-            _ => Err(anyhow!("Unexpected error: {}", resp.error())),
+            Err(Error::Transport(err)) => Err(HealthchecksApiError::TransportError(Box::new(err))),
         }
     }
 
     /// Pauses the [`Check`] with the given UUID or unique key.
-    pub fn pause(&self, check_id: &str) -> anyhow::Result<Check> {
-        let mut r = &mut post(&format!(
-            "{}/checks/{}/pause",
-            HEALTHCHECK_API_URL, check_id
-        ));
-        r = self.set_headers(r);
-        let resp = r.send_string("");
-        match resp.status() {
-            200 => Ok(resp
-                .into_json_deserialize::<Check>()
-                .context("Failed to parse API response")?),
-            401 => Err(anyhow!("Invalid API key")),
-            403 => Err(anyhow!("Access denied")),
-            404 => Err(anyhow!(
-                "Failed to find a check with the uuid: {}",
-                check_id
+    pub fn pause(&self, check_id: &str) -> ApiResult<Check> {
+        let r = self.ureq_post(format!("{}/checks/{}/pause", HEALTHCHECK_API_URL, check_id));
+        match r.call() {
+            Ok(response) => Ok(response.into_json::<Check>()?),
+            Err(Error::Status(401, _)) => Err(HealthchecksApiError::PossibleReadOnlyKey),
+            Err(Error::Status(403, _)) => Err(HealthchecksApiError::AccessDenied),
+            Err(Error::Status(404, _)) => {
+                Err(HealthchecksApiError::NoCheckFound(check_id.to_string()))
+            }
+            Err(Error::Status(_, response)) => Err(HealthchecksApiError::UnexpectedError(
+                response.into_string()?,
             )),
-            _ => Err(anyhow!("Unexpected error: {}", resp.error())),
+            Err(Error::Transport(err)) => Err(HealthchecksApiError::TransportError(Box::new(err))),
+        }
+    }
+
+    /// Get a list of check's logged pings with the given UUID or unique key.
+    pub fn list_logged_pings(&self, check_id: &str) -> ApiResult<Vec<Ping>> {
+        #[derive(serde::Deserialize)]
+        struct PingsResult {
+            pub pings: Vec<Ping>,
+        }
+        let r = self.ureq_post(format!("{}/checks/{}/pings", HEALTHCHECK_API_URL, check_id));
+        match r.send_string("") {
+            Ok(response) => Ok(response.into_json::<PingsResult>()?.pings),
+            Err(Error::Status(401, _)) => Err(HealthchecksApiError::InvalidAPIKey),
+            Err(Error::Status(403, _)) => Err(HealthchecksApiError::AccessDenied),
+            Err(Error::Status(404, _)) => {
+                Err(HealthchecksApiError::NoCheckFound(check_id.to_string()))
+            }
+            Err(Error::Status(_, response)) => Err(HealthchecksApiError::UnexpectedError(
+                response.into_string()?,
+            )),
+            Err(Error::Transport(err)) => Err(HealthchecksApiError::TransportError(Box::new(err))),
+        }
+    }
+
+    /// Get a list of check's status changes with the given UUID or unique key.
+    pub fn list_status_changes(&self, check_id: &str) -> ApiResult<Vec<Flip>> {
+        let r = self.ureq_post(format!("{}/checks/{}/flips", HEALTHCHECK_API_URL, check_id));
+        match r.call() {
+            Ok(response) => Ok(response.into_json::<Vec<Flip>>()?),
+            Err(Error::Status(401, _)) => Err(HealthchecksApiError::InvalidAPIKey),
+            Err(Error::Status(403, _)) => Err(HealthchecksApiError::AccessDenied),
+            Err(Error::Status(404, _)) => {
+                Err(HealthchecksApiError::NoCheckFound(check_id.to_string()))
+            }
+            Err(Error::Status(_, response)) => Err(HealthchecksApiError::UnexpectedError(
+                response.into_string()?,
+            )),
+            Err(Error::Transport(err)) => Err(HealthchecksApiError::TransportError(Box::new(err))),
         }
     }
 
     /// Deletes the [`Check`] with the given UUID or unique key.
-    pub fn delete(&self, check_id: &str) -> anyhow::Result<Check> {
-        let mut r = &mut delete(&format!(
-            "{}/{}/{}",
-            HEALTHCHECK_API_URL, "checks", check_id
-        ));
-        r = self.set_headers(r);
-        let resp = r.call();
-        match resp.status() {
-            200 => Ok(resp
-                .into_json_deserialize::<Check>()
-                .context("Failed to parse API response")?),
-            401 => Err(anyhow!("Invalid API key")),
-            403 => Err(anyhow!("Access denied")),
-            404 => Err(anyhow!(
-                "Failed to find a check with the uuid: {}",
-                check_id
+    pub fn delete(&self, check_id: &str) -> ApiResult<Check> {
+        let r = self.ureq_delete(format!("{}/{}/{}", HEALTHCHECK_API_URL, "checks", check_id));
+        match r.call() {
+            Ok(response) => Ok(response.into_json::<Check>()?),
+            Err(Error::Status(401, _)) => Err(HealthchecksApiError::InvalidAPIKey),
+            Err(Error::Status(403, _)) => Err(HealthchecksApiError::AccessDenied),
+            Err(Error::Status(404, _)) => {
+                Err(HealthchecksApiError::NoCheckFound(check_id.to_string()))
+            }
+            Err(Error::Status(_, response)) => Err(HealthchecksApiError::UnexpectedError(
+                response.into_string()?,
             )),
-            _ => Err(anyhow!("Unexpected error: {}", resp.error())),
+            Err(Error::Transport(err)) => Err(HealthchecksApiError::TransportError(Box::new(err))),
         }
     }
 
     /// Creates a new check with the given [`NewCheck`] configuration.
-    pub fn create_check(&self, check: NewCheck) -> anyhow::Result<Check> {
-        let check_json =
-            serde_json::to_value(check).expect("Failed to convert check into valid JSON");
-        let mut r = &mut post(&format!("{}/{}/", HEALTHCHECK_API_URL, "checks"));
-        r = self.set_headers(r);
-        let resp = r
+    pub fn create_check(&self, check: NewCheck) -> ApiResult<Check> {
+        let check_json = serde_json::to_value(check)?;
+        let r = self.ureq_post(format!("{}/{}/", HEALTHCHECK_API_URL, "checks"));
+        match r
             .set("Content-Type", "application/json")
-            .send_json(check_json);
-        match resp.status() {
-            201 => Ok(resp
-                .into_json_deserialize::<Check>()
-                .context("Failed to parse API response")?),
-            200 => Err(anyhow!(
-                "An existing check was matched based on the \"unique\" parameter"
+            .send_json(check_json)
+        {
+            Ok(response) => match response.status() {
+                201 => Ok(response.into_json::<Check>()?),
+                200 => Err(HealthchecksApiError::ExistingCheckMatched),
+                _ => Err(HealthchecksApiError::UnexpectedError(format!(
+                    "Invalid result code: {}",
+                    response.status()
+                ))),
+            },
+            Err(Error::Status(400, _)) => Err(HealthchecksApiError::NotWellFormed),
+            Err(Error::Status(401, _)) => Err(HealthchecksApiError::InvalidAPIKey),
+            Err(Error::Status(403, _)) => Err(HealthchecksApiError::CheckLimitReached),
+            Err(Error::Status(_, response)) => Err(HealthchecksApiError::UnexpectedError(
+                response.into_string()?,
             )),
-            400 => Err(anyhow!(
-                "The request is not well-formed, violates schema, or uses invalid field values"
-            )),
-            401 => Err(anyhow!("Invalid API key")),
-            403 => Err(anyhow!("The account's check limit has been reached")),
-            _ => Err(anyhow!("Unexpected error: {}", resp.error())),
+            Err(Error::Transport(err)) => Err(HealthchecksApiError::TransportError(Box::new(err))),
         }
     }
 
     /// Update the check with the given `check_id` with the data from `check`.
-    pub fn update_check(&self, check: UpdatedCheck, check_id: &str) -> anyhow::Result<Check> {
-        let check_json =
-            serde_json::to_value(check).expect("Failed to convert check into valid JSON");
-        let mut r = &mut post(&format!(
-            "{}/{}/{}",
-            HEALTHCHECK_API_URL, "checks", check_id
-        ));
-        r = self.set_headers(r);
-        let resp = r
+    pub fn update_check(&self, check: UpdatedCheck, check_id: &str) -> ApiResult<Check> {
+        let check_json = serde_json::to_value(check)?;
+        let r = self.ureq_post(format!("{}/{}/{}", HEALTHCHECK_API_URL, "checks", check_id));
+        match r
             .set("Content-Type", "application/json")
-            .send_json(check_json);
-        match resp.status() {
-            200 => Ok(resp
-                .into_json_deserialize::<Check>()
-                .context("Failed to parse API response")?),
-            400 => Err(anyhow!(
-                "The request is not well-formed, violates schema, or uses invalid field values"
+            .send_json(check_json)
+        {
+            Ok(response) => Ok(response.into_json::<Check>()?),
+            Err(Error::Status(400, _)) => Err(HealthchecksApiError::NotWellFormed),
+            Err(Error::Status(401, _)) => Err(HealthchecksApiError::InvalidAPIKey),
+            Err(Error::Status(403, _)) => Err(HealthchecksApiError::AccessDenied),
+            Err(Error::Status(404, _)) => {
+                Err(HealthchecksApiError::NoCheckFound(check_id.to_string()))
+            }
+            Err(Error::Status(_, response)) => Err(HealthchecksApiError::UnexpectedError(
+                response.into_string()?,
             )),
-            401 => Err(anyhow!("Invalid API key")),
-            403 => Err(anyhow!("Access denied")),
-            404 => Err(anyhow!(
-                "Failed to find a check with the uuid: {}",
-                check_id
-            )),
-            _ => Err(anyhow!("Unexpected error: {}", resp.error())),
+            Err(Error::Transport(err)) => Err(HealthchecksApiError::TransportError(Box::new(err))),
         }
     }
 }
